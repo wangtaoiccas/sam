@@ -9,7 +9,7 @@ from PyQt5.QtCore import Qt, QPoint
 from PyQt5.QtGui import QImage, QPainter, QPen, QColor, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QAction, QMessageBox,
-    QVBoxLayout, QInputDialog, QLabel, QStatusBar
+    QVBoxLayout, QInputDialog, QLabel, QStatusBar, QSlider
 )
 
 from app.model_wrapper import ModelWrapper
@@ -28,8 +28,13 @@ class ImageViewer(QWidget):
 
         self._scaled_pix: QPixmap = None
         self._scale: float = 1.0
+        self._base_fit_scale: float = 1.0
         self._offset_x: int = 0
         self._offset_y: int = 0
+        self._user_scaled: bool = False
+        self._is_panning: bool = False
+        self._last_pan_pos: QPoint = None
+        self.overlay_opacity: float = 0.35  # 0..1
 
     def has_image(self) -> bool:
         return self.image_np is not None
@@ -55,6 +60,10 @@ class ImageViewer(QWidget):
             h, w = overlay_rgba.shape[:2]
             qimg = QImage(overlay_rgba.data, w, h, w * 4, QImage.Format_RGBA8888)
             self.overlay_qimage = qimg.copy()  # copy to own the data
+        self.update()
+
+    def set_overlay_opacity(self, opacity: float) -> None:
+        self.overlay_opacity = float(max(0.0, min(1.0, opacity)))
         self.update()
 
     def add_annotation(self, polygon: List[Tuple[float, float]], label: str) -> None:
@@ -86,13 +95,17 @@ class ImageViewer(QWidget):
         ih = self.image_qpix.height()
         ww = max(1, self.width())
         wh = max(1, self.height())
-        scale = min(ww / iw, wh / ih)
-        self._scale = scale
-        sw = int(iw * scale)
-        sh = int(ih * scale)
+        self._base_fit_scale = min(ww / iw, wh / ih)
+        if not self._user_scaled:
+            self._scale = self._base_fit_scale
+            sw = int(iw * self._scale)
+            sh = int(ih * self._scale)
+            self._offset_x = (ww - sw) // 2
+            self._offset_y = (wh - sh) // 2
+        # Always refresh scaled pix with current scale
+        sw = int(iw * self._scale)
+        sh = int(ih * self._scale)
         self._scaled_pix = self.image_qpix.scaled(sw, sh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self._offset_x = (ww - sw) // 2
-        self._offset_y = (wh - sh) // 2
 
     def _widget_to_image_xy(self, pos: QPoint) -> Tuple[int, int]:
         if self._scaled_pix is None:
@@ -106,7 +119,12 @@ class ImageViewer(QWidget):
         return (x, y)
 
     def mousePressEvent(self, event) -> None:
-        self.parent().on_canvas_mouse_press(event)
+        if event.button() == Qt.MiddleButton:
+            self._is_panning = True
+            self._last_pan_pos = event.pos()
+            return
+        if event.button() == Qt.LeftButton:
+            self.parent().on_canvas_mouse_press(event)
 
     def paintEvent(self, event) -> None:
         p = QPainter(self)
@@ -117,7 +135,10 @@ class ImageViewer(QWidget):
                 ow = int(self.overlay_qimage.width() * self._scale)
                 oh = int(self.overlay_qimage.height() * self._scale)
                 overlay_scaled = self.overlay_qimage.scaled(ow, oh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                p.save()
+                p.setOpacity(self.overlay_opacity)
                 p.drawImage(self._offset_x, self._offset_y, overlay_scaled)
+                p.restore()
             # draw polygons
             pen = QPen(QColor(0, 255, 0), 2)
             p.setPen(pen)
@@ -133,6 +154,52 @@ class ImageViewer(QWidget):
                     sy2 = int(y2 * self._scale) + self._offset_y
                     p.drawLine(sx1, sy1, sx2, sy2)
         p.end()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._is_panning and self._last_pan_pos is not None:
+            dx = event.pos().x() - self._last_pan_pos.x()
+            dy = event.pos().y() - self._last_pan_pos.y()
+            self._offset_x += dx
+            self._offset_y += dy
+            self._last_pan_pos = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MiddleButton:
+            self._is_panning = False
+            self._last_pan_pos = None
+
+    def wheelEvent(self, event) -> None:
+        if self.image_qpix is None:
+            return
+        angle = event.angleDelta().y()
+        if angle == 0:
+            return
+        steps = angle / 120.0
+        factor = 1.15 ** steps
+        self._zoom_at(event.pos(), factor)
+
+    def _zoom_at(self, widget_pos: QPoint, factor: float) -> None:
+        # Compute image coords under cursor before zoom
+        ix, iy = self._widget_to_image_xy(widget_pos)
+        old_scale = self._scale
+        new_scale = max(0.05, min(20.0, old_scale * factor))
+        if abs(new_scale - old_scale) < 1e-6:
+            return
+        self._scale = new_scale
+        self._user_scaled = True
+        # Keep cursor anchored: wx = ox' + ix*s'
+        wx = widget_pos.x()
+        wy = widget_pos.y()
+        self._offset_x = int(wx - ix * self._scale)
+        self._offset_y = int(wy - iy * self._scale)
+        # Recompute scaled pix
+        iw = self.image_qpix.width()
+        ih = self.image_qpix.height()
+        sw = int(iw * self._scale)
+        sh = int(ih * self._scale)
+        self._scaled_pix = self.image_qpix.scaled(sw, sh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.update()
 
 
 class MainWindow(QMainWindow):
@@ -152,6 +219,16 @@ class MainWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage(f"Backend: {self.model.get_backend_info()}")
+        # Opacity slider
+        self.opacity_label = QLabel("Opacity:")
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(int(self.viewer.overlay_opacity * 100))
+        self.opacity_slider.setFixedWidth(160)
+        self.opacity_slider.setToolTip("Mask opacity")
+        self.opacity_slider.valueChanged.connect(lambda v: self.viewer.set_overlay_opacity(v / 100.0))
+        self.status.addPermanentWidget(self.opacity_label)
+        self.status.addPermanentWidget(self.opacity_slider)
 
         self._image_path: str = ""
 
